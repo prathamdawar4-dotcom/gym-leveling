@@ -406,7 +406,10 @@ const rebuildSessionShadowsFromHistory = (history = [], existing = {}) => {
 
 const normalizeStoredState = (current = null, legacy = null) => {
   const base = { ...INITIAL_STATE, ...(legacy || {}), ...(current || {}) };
-  const workoutHistory = mergeWorkoutHistories(current?.workoutHistory, legacy?.workoutHistory);
+  // IMPORTANT: legacy v3 comes first so duplicated historical workouts keep their
+  // original set.weight values instead of an already-migrated v4 copy that may
+  // contain weightKg: 0. Any workouts that exist only in v4 are still appended.
+  const workoutHistory = mergeWorkoutHistories(legacy?.workoutHistory, current?.workoutHistory);
   const exercisePRs = rebuildExercisePRsFromHistory(workoutHistory, {
     ...(legacy?.exercisePRs || {}),
     ...(current?.exercisePRs || {}),
