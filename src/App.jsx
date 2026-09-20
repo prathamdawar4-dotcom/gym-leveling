@@ -7,6 +7,7 @@ const APP_KEY = "gym_lvl_v4";
 const LEGACY_APP_KEY = "gym_lvl_v3";
 const ACTIVE_WORKOUT_KEY = "gym_lvl_active_workout_v1";
 const JOURNAL_KEY = "gym_lvl_journal_v1";
+const MIGRATION_BACKUP_KEY = "gym_lvl_pre_migration_backup_v1";
 
 const safeParse = (raw, fallback) => {
   try {
@@ -306,11 +307,139 @@ const INITIAL_STATE = {
   ],
 };
 
+const normalizeStoredSet = (set = {}) => {
+  const currentKg = parseFloat(set.weightKg) || 0;
+  const legacyKg = parseFloat(set.weight) || parseFloat(set.kg) || 0;
+  const weightKg = currentKg || legacyKg;
+  return {
+    ...set,
+    weightKg,
+    displayWeight: set.displayWeight ?? (weightKg ? String(round(weightKg, 2)) : ""),
+    reps: set.reps ?? "",
+  };
+};
+
+const normalizeStoredWorkout = (workout = {}) => {
+  const exercises = (workout.exercises || []).map((ex) => ({
+    ...ex,
+    sets: (ex.sets || []).map(normalizeStoredSet),
+  }));
+  const calculatedVolume = calculateSessionVolumeKg(exercises);
+  return {
+    ...workout,
+    exercises,
+    totalVolumeKg: parseFloat(workout.totalVolumeKg) || parseFloat(workout.totalVolume) || calculatedVolume,
+  };
+};
+
+const mergeWorkoutHistories = (...histories) => {
+  const out = [];
+  const seen = new Set();
+  histories.forEach((history) => {
+    (history || []).forEach((workout) => {
+      const key = workout?.id || `${workout?.date || ""}|${workout?.muscle || ""}|${workout?.name || ""}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(normalizeStoredWorkout(workout));
+    });
+  });
+  return out.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+};
+
+const rebuildExercisePRsFromHistory = (history = [], existing = {}) => {
+  const rebuilt = {};
+
+  Object.entries(existing || {}).forEach(([name, pr]) => {
+    const legacyWeightKg = parseFloat(pr?.bestWeightKg) || parseFloat(pr?.weight) || 0;
+    const legacyReps = parseInt(pr?.bestReps ?? pr?.reps) || 0;
+    const legacyIntensity = parseFloat(pr?.bestIntensity) || calculateSetIntensity(legacyWeightKg, legacyReps);
+    const legacyVolume = parseFloat(pr?.bestVolumeKg) || parseFloat(pr?.totalVolumeKg) || (legacyWeightKg * legacyReps) || 0;
+    rebuilt[name] = {
+      ...pr,
+      weight: legacyWeightKg,
+      reps: legacyReps,
+      bestWeightKg: legacyWeightKg,
+      bestReps: legacyReps,
+      bestIntensity: legacyIntensity,
+      bestVolumeKg: legacyVolume,
+    };
+  });
+
+  history.forEach((workout) => {
+    (workout.exercises || []).forEach((ex) => {
+      const stats = calculateExerciseStats(ex.sets || []);
+      if (!stats.validSets) return;
+      const prev = rebuilt[ex.name] || {};
+      const prevIntensity = parseFloat(prev.bestIntensity) || calculateSetIntensity(prev.bestWeightKg || prev.weight || 0, prev.bestReps || prev.reps || 0);
+      const prevVolume = parseFloat(prev.bestVolumeKg) || parseFloat(prev.totalVolumeKg) || ((prev.weight || 0) * (prev.reps || 0)) || 0;
+      const betterIntensity = stats.bestIntensity > prevIntensity;
+      rebuilt[ex.name] = {
+        ...prev,
+        weight: betterIntensity ? stats.bestWeightKg : (prev.weight || prev.bestWeightKg || stats.bestWeightKg),
+        reps: betterIntensity ? stats.bestReps : (prev.reps || prev.bestReps || stats.bestReps),
+        bestWeightKg: betterIntensity ? stats.bestWeightKg : (prev.bestWeightKg || prev.weight || stats.bestWeightKg),
+        bestReps: betterIntensity ? stats.bestReps : (prev.bestReps || prev.reps || stats.bestReps),
+        bestIntensity: Math.max(prevIntensity, stats.bestIntensity),
+        bestVolumeKg: Math.max(prevVolume, stats.totalVolumeKg),
+        date: betterIntensity ? workout.date : (prev.date || workout.date),
+      };
+    });
+  });
+
+  return rebuilt;
+};
+
+const rebuildSessionShadowsFromHistory = (history = [], existing = {}) => {
+  const shadows = { ...(existing || {}) };
+  history.forEach((workout) => {
+    if (!workout?.muscle || shadows[workout.muscle]) return;
+    const totalVolumeKg = parseFloat(workout.totalVolumeKg) || calculateSessionVolumeKg(workout.exercises || []);
+    if (!totalVolumeKg) return;
+    shadows[workout.muscle] = {
+      totalVolumeKg,
+      date: workout.date,
+      workoutId: workout.id,
+    };
+  });
+  return shadows;
+};
+
+const normalizeStoredState = (current = null, legacy = null) => {
+  const base = { ...INITIAL_STATE, ...(legacy || {}), ...(current || {}) };
+  const workoutHistory = mergeWorkoutHistories(current?.workoutHistory, legacy?.workoutHistory);
+  const exercisePRs = rebuildExercisePRsFromHistory(workoutHistory, {
+    ...(legacy?.exercisePRs || {}),
+    ...(current?.exercisePRs || {}),
+  });
+  const sessionShadows = rebuildSessionShadowsFromHistory(workoutHistory, {
+    ...(legacy?.sessionShadows || {}),
+    ...(current?.sessionShadows || {}),
+  });
+
+  return {
+    ...base,
+    workoutHistory,
+    exercisePRs,
+    sessionShadows,
+  };
+};
+
 const loadAppState = () => {
   const v4 = loadJSON(APP_KEY, null);
-  if (v4) return { ...INITIAL_STATE, ...v4 };
   const legacy = loadJSON(LEGACY_APP_KEY, null);
-  if (legacy) return { ...INITIAL_STATE, ...legacy };
+
+  // Keep an untouched emergency snapshot before converting old workout fields.
+  try {
+    if (!localStorage.getItem(MIGRATION_BACKUP_KEY) && (v4 || legacy)) {
+      localStorage.setItem(MIGRATION_BACKUP_KEY, JSON.stringify({
+        createdAt: new Date().toISOString(),
+        v4,
+        legacy,
+      }));
+    }
+  } catch {}
+
+  if (v4 || legacy) return normalizeStoredState(v4, legacy);
   return { ...INITIAL_STATE };
 };
 
