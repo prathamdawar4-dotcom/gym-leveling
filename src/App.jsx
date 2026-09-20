@@ -177,6 +177,13 @@ const persistActiveDraft = (draft) => {
 
 const loadActiveDraft = () => loadJSON(ACTIVE_WORKOUT_KEY, null);
 
+const removeActiveJournalDraft = (draftId) => {
+  const current = loadJSON(JOURNAL_KEY, []);
+  const next = current.filter((entry) => !(entry.id === draftId && entry.status === "active"));
+  saveJSON(JOURNAL_KEY, next);
+  return next;
+};
+
 // ─────────────────────────────────────────────────────────────
 // GAME LOGIC
 // ─────────────────────────────────────────────────────────────
@@ -658,7 +665,7 @@ const DashboardScreen = ({ state, activeDraft, onStartWorkout, onResumeWorkout, 
 // ─────────────────────────────────────────────────────────────
 // WORKOUT
 // ─────────────────────────────────────────────────────────────
-const WorkoutScreen = ({ state, initialDraft, onDraftSaved, onSaveCustomExercise, onFinish, onExit }) => {
+const WorkoutScreen = ({ state, initialDraft, onDraftSaved, onSaveCustomExercise, onFinish, onExit, onCancel }) => {
   const [draft, setDraft] = useState(() => initialDraft || createEmptyDraft({ state, unit: state.preferredUnit || "lb" }));
   const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - (initialDraft?.startTime || Date.now())) / 1000));
   const [showAddExercise, setShowAddExercise] = useState(false);
@@ -701,6 +708,16 @@ const WorkoutScreen = ({ state, initialDraft, onDraftSaved, onSaveCustomExercise
   };
 
   const fmtTime = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+
+  const requestCancel = () => {
+    const hasLoggedData = (draft.exercises || []).some((ex) =>
+      (ex.sets || []).some((set) => (parseFloat(set.weightKg) || 0) > 0 || (parseInt(set.reps, 10) || 0) > 0)
+    );
+    const message = hasLoggedData
+      ? "Cancel this workout and permanently delete this unfinished draft? Your completed workout history, PRs, EXP, and achievements will not be affected."
+      : "Cancel this workout and remove the empty draft from your Journal? Your completed workout history will not be affected.";
+    if (window.confirm(message)) onCancel(draft);
+  };
 
   const setUnit = (newUnit) => {
     if (newUnit === draft.unit) return;
@@ -826,6 +843,7 @@ const WorkoutScreen = ({ state, initialDraft, onDraftSaved, onSaveCustomExercise
 
         <button className="btn btn-primary" onClick={() => mutate((prev) => ({ ...prev, phase: "logging" }))}>START LOGGING →</button>
         <button className="btn btn-ghost" style={{ marginTop: 8 }} onClick={onExit}>← Back Home (draft stays saved)</button>
+        <button className="btn btn-red" style={{ marginTop: 8 }} onClick={requestCancel}>✕ CANCEL WORKOUT / DELETE DRAFT</button>
       </div>
     );
   }
@@ -967,6 +985,7 @@ const WorkoutScreen = ({ state, initialDraft, onDraftSaved, onSaveCustomExercise
 
       {draft.exercises.length > 0 && <button className="btn btn-gold" onClick={() => onFinish(draft)}>✓ FINISH WORKOUT</button>}
       <button className="btn btn-ghost" style={{ marginTop: 8 }} onClick={onExit}>← Home (keep workout active)</button>
+      <button className="btn btn-red" style={{ marginTop: 8 }} onClick={requestCancel}>✕ CANCEL WORKOUT / DELETE DRAFT</button>
     </div>
   );
 };
@@ -1255,6 +1274,16 @@ export default function App() {
 
   const resumeWorkout = () => setScreen("workout");
 
+  const cancelWorkout = (draft) => {
+    if (!draft?.id) return;
+    removeStorage(ACTIVE_WORKOUT_KEY);
+    const nextJournal = removeActiveJournalDraft(draft.id);
+    setActiveDraft(null);
+    setJournalEntries(nextJournal);
+    setScreen("dashboard");
+    showToast("🗑️", "Workout cancelled", "Unfinished draft removed. Completed progress is untouched.");
+  };
+
   const finishWorkout = (draft) => {
     const today = new Date().toDateString();
     const wasYesterday = state.lastWorkoutDate === new Date(Date.now() - 86400000).toDateString();
@@ -1403,7 +1432,7 @@ export default function App() {
       <div className="app">
         <Toast toast={toast} />
         {screen === "dashboard" && <DashboardScreen state={state} activeDraft={activeDraft} onStartWorkout={startWorkout} onResumeWorkout={resumeWorkout} onModeChange={(mode) => setState((s) => ({ ...s, mode }))} onMissionComplete={handleMissionComplete} onJournal={() => setScreen("journal")} />}
-        {screen === "workout" && <WorkoutScreen key={activeDraft?.id || "new_workout"} state={state} initialDraft={activeDraft} onDraftSaved={handleDraftSaved} onSaveCustomExercise={handleSaveCustomExercise} onFinish={finishWorkout} onExit={() => setScreen("dashboard")} />}
+        {screen === "workout" && <WorkoutScreen key={activeDraft?.id || "new_workout"} state={state} initialDraft={activeDraft} onDraftSaved={handleDraftSaved} onSaveCustomExercise={handleSaveCustomExercise} onFinish={finishWorkout} onExit={() => setScreen("dashboard")} onCancel={cancelWorkout} />}
         {screen === "journal" && <JournalScreen entries={journalEntries} />}
         {screen === "missions" && <MissionsScreen state={state} onMissionComplete={handleMissionComplete} />}
         {screen === "progress" && <ProgressScreen state={state} />}
